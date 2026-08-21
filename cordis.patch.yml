@@ -1,0 +1,4 @@
+# dsh-plugin-doctor bundle layer: static plugin vetting tools.
+- insert:
+    - id: plugin-doctor
+      name: '@snow-the/dsh-plugin-doctor'

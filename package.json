@@ -1,0 +1,36 @@
+{
+  "name": "@snow-the/dsh-plugin-doctor",
+  "version": "0.1.0",
+  "description": "Static pre-install vetting for DSH plugins: scans a directory or installed package for exfiltration, credential access, obfuscation, persistence and lifecycle-script red flags (own-built, replacing third-party vetting plugins).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "security",
+    "vetting",
+    "deepseek-harness"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/snow-The/dsh-own-plugins.git",
+    "directory": "dsh-plugin-doctor"
+  },
+  "types": "./dist/index.d.ts"
+}
