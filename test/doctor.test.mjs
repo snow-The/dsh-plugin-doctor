@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const { apply } = await import('../lib/index.js')
+const { apply } = await import('../dist/index.js')
 
 function makeCtx() {
   const tools = []
