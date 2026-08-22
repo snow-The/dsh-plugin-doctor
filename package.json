@@ -13,7 +13,7 @@
     "deepseek-harness"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json --emitDeclarationOnly && esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@deepseek-ai/* --log-level=warning",
     "test": "node --test test/"
   },
   "files": [
@@ -38,6 +38,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   }
 }
