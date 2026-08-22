@@ -9,6 +9,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { join, extname } from 'node:path'
 import { homedir } from 'node:os'
+import { Hono } from 'hono'
 
 export const name = 'plugin-doctor'
 export const inject = ['tools']
@@ -184,4 +185,22 @@ export function apply(ctx: Ctx): void {
   for (const name of ['doctor_scan', 'doctor_scan_path']) {
     try { ctx.tools.register(scanTool(name)) } catch (err) { console.error(`[plugin-doctor] ${name} skipped: ${err}`) }
   }
+
+  // Hono app: try to mount on the host http service when available.
+  try {
+    const http = (ctx as unknown as { http?: { mount?: (p: string, f: unknown) => void } }).http
+    if (http?.mount) http.mount('/doctor', createHonoApp(ctx).fetch)
+  } catch { /* no host http service */ }
+}
+
+// --- Hono app factory (same pattern as dsh-codex) ---
+
+export interface AppEnv {
+  Bindings: { ctx: unknown }
+}
+
+export function createHonoApp(_ctx: unknown): Hono<AppEnv> {
+  const app = new Hono<AppEnv>()
+  app.get('/api/doctor/health', (c) => c.json({ ok: true, plugin: 'dsh-plugin-doctor', ts: true, hono: true, rules: RULES.length }))
+  return app
 }

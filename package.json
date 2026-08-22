@@ -32,5 +32,12 @@
     "url": "https://github.com/snow-The/dsh-own-plugins.git",
     "directory": "dsh-plugin-doctor"
   },
-  "types": "./dist/index.d.ts"
+  "types": "./dist/index.d.ts",
+  "dependencies": {
+    "hono": "^4.13.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
 }

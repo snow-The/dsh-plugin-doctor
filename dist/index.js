@@ -9,6 +9,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, extname } from 'node:path';
 import { homedir } from 'node:os';
+import { Hono } from 'hono';
 export const name = 'plugin-doctor';
 export const inject = ['tools'];
 const HIDDEN = new Set([
@@ -170,4 +171,16 @@ export function apply(ctx) {
             console.error(`[plugin-doctor] ${name} skipped: ${err}`);
         }
     }
+    // Hono app: try to mount on the host http service when available.
+    try {
+        const http = ctx.http;
+        if (http?.mount)
+            http.mount('/doctor', createHonoApp(ctx).fetch);
+    }
+    catch { /* no host http service */ }
+}
+export function createHonoApp(_ctx) {
+    const app = new Hono();
+    app.get('/api/doctor/health', (c) => c.json({ ok: true, plugin: 'dsh-plugin-doctor', ts: true, hono: true, rules: RULES.length }));
+    return app;
 }

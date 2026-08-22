@@ -1,3 +1,4 @@
+import { Hono } from 'hono';
 export declare const name = "plugin-doctor";
 export declare const inject: string[];
 type Json = null | boolean | number | string | Json[] | {
@@ -31,4 +32,10 @@ interface Ctx {
     };
 }
 export declare function apply(ctx: Ctx): void;
+export interface AppEnv {
+    Bindings: {
+        ctx: unknown;
+    };
+}
+export declare function createHonoApp(_ctx: unknown): Hono<AppEnv>;
 export {};
