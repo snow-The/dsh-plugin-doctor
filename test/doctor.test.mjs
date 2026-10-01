@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const { apply, registerHttpRoutes } = await import('../dist/index.js')
+const { apply, registerHttpRoutes, parsePatchInserts } = await import('../dist/index.js')
 
 function makeCtx() {
   const tools = []
@@ -27,10 +27,10 @@ function makeFixture() {
   return dir
 }
 
-test('registers two tools', () => {
+test('registers three tools', () => {
   const ctx = makeCtx()
   apply(ctx)
-  assert.deepEqual(ctx.tools.map((t) => t.name).sort(), ['doctor_scan', 'doctor_scan_path'])
+  assert.deepEqual(ctx.tools.map((t) => t.name).sort(), ['doctor_patch', 'doctor_scan', 'doctor_scan_path'])
 })
 
 test('flags exfil, credentials, and lifecycle in fixture', async () => {
@@ -160,4 +160,187 @@ test('the cordis trap is real, and apply avoids it by using ctx.inject', () => {
 test('apply tolerates a host without webServer (no throw)', () => {
   apply(makeCtx())
   assert.doesNotThrow(() => apply(cordisCtx({ extra: { tools: makeCtx().tools } })))
+})
+
+// --- cordis patch insert-id collision ---
+//
+// The defect these cover is silent by construction: cordis-plugin-loader/lib/index.js:82 builds a map
+// with Object.fromEntries, which keeps the LAST value for a duplicate key, so an insert row whose id
+// collides is dropped without a log line. Nothing else in the toolchain reports it.
+
+test('parsePatchInserts reads the observed cordis.patch.yml schema', () => {
+  const rows = parsePatchInserts([
+    '# a bundle layer',
+    '- insert:',
+    "    - id: plugin-doctor",
+    "      name: '@snow-the/dsh-plugin-doctor'",
+    '',
+  ].join('\n'))
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].id, 'plugin-doctor')
+  assert.equal(rows[0].name, '@snow-the/dsh-plugin-doctor')
+  assert.equal(rows[0].line, 3)
+})
+
+test('parsePatchInserts sees DIRECT rows too, not just `insert:` wrappers', () => {
+  // This is the live shape of ~/.dsh/profiles/web/cordis.patch.yml: one flat list, where all but
+  // one row are direct. Requiring deeper indentation than an `insert:` marker missed 58 of its 59
+  // rows and hid a real cross-file duplicate.
+  const rows = parsePatchInserts([
+    '- id: web',
+    '  config:',
+    '    searchProvider: dsh-search',
+    '',
+    '- insert:',
+    '    - id: authorization',
+    "      name: '@deepseek-ai/dsh-authorization'",
+    '',
+    '- id: llm-commandcode',
+    '  name: "@mars-sea/dsh-commandcode-provider"',
+    '  config:',
+    '    apiKeyEnv: COMMANDCODE_API_KEY',
+  ].join('\n'))
+  assert.deepEqual(rows.map((r) => [r.id, r.name, r.line]), [
+    ['web', null, 1],
+    ['authorization', '@deepseek-ai/dsh-authorization', 6],
+    ['llm-commandcode', '@mars-sea/dsh-commandcode-provider', 9],
+  ])
+})
+
+test('parsePatchInserts ignores id-like lines with no list marker', () => {
+  const rows = parsePatchInserts(['id: not-a-row', 'name: nope'].join('\n'))
+  assert.deepEqual(rows, [])
+})
+
+// Regression: this exact shape is live in @linxin666/dsh-web-all. Its opt-in rows sit at the SAME
+// indent as the `- insert:` marker, so a block-end test that only looked for a non-`-` line kept the
+// block open and read every `- id: … / disabled: true` directive as a nameless insert row — which
+// then looked like a duplicate of the real declaration above it. Seven false positives.
+test('a nameless config row is not a declaration', () => {
+  const rows = parsePatchInserts([
+    '  # from ../dsh-ssh',
+    '  - insert:',
+    "      - id: web-ui-ssh",
+    "        name: '@linxin666/dsh-web-all/ssh'",
+    '        config:',
+    "          plugin: '@linxin666/dsh-ssh'",
+    '',
+    '  # inactive by default (opt-in rows)',
+    '  - id: web-ui-ssh',
+    '    disabled: true',
+  ].join('\n'))
+  assert.equal(rows.length, 2, 'both rows are parsed…')
+  assert.equal(rows[0].name, '@linxin666/dsh-web-all/ssh')
+  assert.equal(rows[1].name, null, '…but only the first one DECLARES the entry')
+  assert.equal(rows[1].disabled, true)
+})
+
+function patchFixture(files) {
+  const dir = mkdtempSync(join(tmpdir(), 'doctor-patch-'))
+  for (const [name, body] of Object.entries(files)) {
+    const full = join(dir, name)
+    mkdirSync(join(full, '..'), { recursive: true })
+    writeFileSync(full, body)
+  }
+  return dir
+}
+
+test('two declarations of one id in ONE file is reported as HIGH and names both lines', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  const dir = patchFixture({
+    'cordis.patch.yml': [
+      '- insert:',
+      "    - id: shared",
+      "      name: '@x/one'",
+      "    - id: shared",
+      "      name: '@x/two'",
+    ].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  assert.equal(r.verdict, 'HIGH')
+  assert.equal(r.declarationCount, 2)
+  assert.equal(r.uniqueIds, 1)
+  const dup = r.issues.find((i) => i.kind === 'duplicate-declaration-same-file')
+  assert.ok(dup, 'expected a same-file duplicate issue')
+  assert.equal(dup.where.length, 2)
+  assert.match(dup.where[0], /:2/)
+  assert.match(dup.where[1], /:4/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('the same id across TWO patch files is reported as MEDIUM, not HIGH', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  const dir = patchFixture({
+    'a/cordis.patch.yml': ['- insert:', '    - id: shared', "      name: '@x/one'"].join('\n'),
+    'b/cordis.patch.yml': ['- insert:', '    - id: shared', "      name: '@x/two'"].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  assert.equal(r.verdict, 'MEDIUM')
+  assert.equal(r.issues.length, 1)
+  assert.equal(r.issues[0].kind, 'duplicate-declaration-cross-file')
+  assert.equal(r.patchFiles, 2)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('unique ids are clean', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  const dir = patchFixture({
+    'cordis.patch.yml': ['- insert:', '    - id: one', "      name: '@x/one'", '    - id: two', "      name: '@x/two'"].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  assert.equal(r.verdict, 'SAFE')
+  assert.deepEqual(r.issues, [])
+  assert.equal(r.uniqueIds, 2)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('a config row that near-misses a declared id is reported as a likely typo', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  const dir = patchFixture({
+    'cordis.patch.yml': [
+      '- insert:',
+      "    - id: tool-subagent",
+      "      name: '@x/tool-subagent'",
+      '- id: tool-subagnt',
+      '  disabled: true',
+    ].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  const issue = r.issues.find((i) => i.kind === 'dangling-config-row')
+  assert.ok(issue, 'a one-edit typo must be reported')
+  assert.equal(issue.id, 'tool-subagnt')
+  assert.equal(issue.severity, 2)
+  assert.match(issue.detail, /tool-subagent/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('a config row owned by a bundle outside the scan is informational, not an issue', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  // This is the live shape of dsh-experimental-agent-team-profile/cordis.patch.yml: it toggles
+  // ids that dsh-base declares, and dsh-base is not inside a profile's node_modules.
+  const dir = patchFixture({
+    'cordis.patch.yml': ['- id: tool-subagent-control', '  disabled: true'].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  assert.deepEqual(r.issues, [], 'out-of-scope ownership must not be reported as a problem')
+  assert.equal(r.verdict, 'SAFE')
+  assert.deepEqual(r.unresolvedConfigIds, [{ id: 'tool-subagent-control', where: `${join(dir, 'cordis.patch.yml')}:1` }])
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('a config row beside its own declaration is NOT dangling', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  const dir = patchFixture({
+    'cordis.patch.yml': ['- insert:', '    - id: a', "      name: '@x/a'", '', '- id: a', '  disabled: true'].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  assert.equal(r.verdict, 'SAFE', 'declare-then-toggle is the documented opt-in pattern')
+  assert.equal(r.declarationCount, 1)
+  assert.equal(r.configRowCount, 1)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('doctor_patch rejects relative paths', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  await assert.rejects(() => ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: 'x' }), /absolute/)
 })

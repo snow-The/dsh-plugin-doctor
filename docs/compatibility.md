@@ -3,7 +3,7 @@
 > 本文件由 `~/.dsh-starter/plugins/_p0/gen-compat-docs.mjs` 从插件清单与宿主实测**生成**。
 > **请勿手改** —— 手改的内容会被下一次生成覆盖。要改，改生成器或改 `package.json`。
 >
-> 生成器版本 `1.0.0` · 宿主 `0.2.0-rc.2` · 插件 `@snow-the/dsh-plugin-doctor@0.1.0`
+> 生成器版本 `1.0.0` · 宿主 `0.2.0-rc.2` · 插件 `@snow-the/dsh-plugin-doctor@0.2.0`
 
 ## 支持的 dsh 版本
 
@@ -39,7 +39,7 @@
 用**宿主自己的** `evaluatePluginCompatibility`（不是我们自己实现的等价物）在本机安装树的版本上判定本插件的真实 `package.json`：
 
 ```
-插件        @snow-the/dsh-plugin-doctor@0.1.0
+插件        @snow-the/dsh-plugin-doctor@0.2.0
 宿主        0.2.0-rc.2
 判定        PASS（peerDependencies 无冲突，不会被禁用）
 ```

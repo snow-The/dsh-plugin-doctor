@@ -165,6 +165,227 @@ async function scanTarget(root: string) {
   return { root, files: files.length, scanned: files.length, results, hits: allHits.length, lifecycle, ...scoreHits(allHits) }
 }
 
+// --- cordis patch insert-id collision check ---
+//
+// WHY THIS EXISTS — measured against @deepseek-ai/cordis-plugin-loader@0.2.0-rc.2:
+//
+//   lib/index.js:58-64  EntryGroup.create(options)
+//   :59    const id = this.tree.ensureId(options);
+//   :60    const entry = this.tree.store[id] ??= new Entry(this.ctx.loader);   // duplicate id REUSES the entry
+//   :62    await entry.update(options, true, true);                            // ...and overwrites its options
+//
+//   lib/index.js:78-92  EntryGroup.update(config)
+//   :81    const oldMap = Object.fromEntries(oldConfig.map((o) => [o.id, o]));
+//   :82    const newMap = Object.fromEntries(config.map((o) => [o.id ?? Symbol('anonymous'), o]));
+//   :83-86 const ids = Reflect.ownKeys({ ...oldMap, ...newMap });
+//
+// `Object.fromEntries` keeps the LAST value for a duplicated key, so TWO insert rows carrying the
+// SAME `id` in one list collapse: the earlier row is dropped and nothing is logged. The plugin it
+// named never mounts, and the failure is silent — there is no error to search for.
+//
+// Cross-FILE duplicates (two bundles inserting the same id) take the `??=` path instead: the entry
+// is reused and `update()` replaces its options, so the first registrant is overwritten. Whether
+// that is harmful depends on what `Entry.update` does to a live fiber, so this check reports it as
+// "review", not as proven misbehaviour. The same-file case is reported as proven.
+//
+// The parser below is deliberately NOT a YAML parser. This plugin has zero runtime dependencies,
+// and the insert schema is a flat list — a line scanner tracks it exactly and cannot mis-parse
+// anchors/tags the way a partial YAML implementation would.
+
+interface PatchInsert { id: string; name: string | null; disabled: boolean; line: number }
+
+const unquote = (v: string): string => {
+  const t = v.trim()
+  if ((t.startsWith("'") && t.endsWith("'") && t.length > 1) || (t.startsWith('"') && t.endsWith('"') && t.length > 1)) {
+    return t.slice(1, -1)
+  }
+  return t
+}
+
+/**
+ * Extract loader rows from a cordis patch file.
+ *
+ * MEASURED SCHEMA — a patch file is ONE list of rows, and a row arrives in either of two forms:
+ *
+ *     - id: llm-commandcode              # (a) a direct row
+ *       name: "@mars-sea/…"
+ *       config: { … }
+ *
+ *     - insert:                          # (b) a wrapper whose children are rows
+ *         - id: authorization
+ *           name: "@deepseek-ai/dsh-authorization"
+ *
+ * Both declare a loader entry id, so both must be parsed. A row carrying `name` DECLARES the entry;
+ * a row without `name` only configures or toggles an existing one (`- id: web-ui-ssh` +
+ * `disabled: true`), which is legitimate and must not be mistaken for a second declaration.
+ *
+ * Two earlier versions got this wrong and produced false positives on live profiles:
+ *   v1 treated every `- id:` after an `insert:` marker as an insert row, so top-level `disabled:`
+ *      directives looked like duplicates of the row above them;
+ *   v2 fixed that by requiring deeper indentation, which then missed every DIRECT row — dropping 58
+ *      of the 59 rows in the real profile patch and hiding a genuine cross-file duplicate.
+ */
+export function parsePatchInserts(text: string): PatchInsert[] {
+  const rows: PatchInsert[] = []
+  const lines = text.split(/\r?\n/)
+  let current: PatchInsert | null = null
+  let currentIndent = -1
+  for (let i = 0; i < lines.length; i++) {
+    const stripped = lines[i].replace(/(^|\s)#.*$/, '')
+    if (stripped.trim() === '') continue
+    const indent = stripped.length - stripped.trimStart().length
+    const t = stripped.trim()
+
+    const rowStart = /^-\s*id:\s*(.+)$/.exec(t)
+    if (rowStart) {
+      current = { id: unquote(rowStart[1]), name: null, disabled: false, line: i + 1 }
+      currentIndent = indent
+      rows.push(current)
+      continue
+    }
+    // `- insert:` is a wrapper, never a row.
+    if (/^-\s*insert:\s*$/.test(t) || t === 'insert:') { current = null; currentIndent = -1; continue }
+
+    const kv = /^(name|disabled):\s*(.+)$/.exec(t)
+    if (kv && current !== null && indent > currentIndent) {
+      if (kv[1] === 'name') current.name = unquote(kv[2])
+      else current.disabled = unquote(kv[2]) === 'true'
+      continue
+    }
+    // Any other key at or above the row's indent ends that row.
+    if (current !== null && indent <= currentIndent) { current = null; currentIndent = -1 }
+  }
+  return rows
+}
+
+const PATCH_NAME_RE = /(?:^|[\\/])(?:cordis\.patch\.yml|cordis\.yml)$/
+
+interface PatchIssue {
+  kind: 'duplicate-declaration-same-file' | 'duplicate-declaration-cross-file' | 'dangling-config-row'
+  severity: 1 | 2 | 3
+  id: string
+  detail: string
+  where: string[]
+}
+
+/** Scan one root (a plugin dir, or a profile whose node_modules holds bundle patches). */
+async function analyzePatches(root: string) {
+  const files: string[] = []
+  const st = await stat(root).catch(() => null)
+  if (!st) throw new Error(`path not found: ${root}`)
+  if (st.isFile()) {
+    files.push(root)
+  } else {
+    for (const f of await walkFiles(root)) if (PATCH_NAME_RE.test(f)) files.push(f)
+    // A profile keeps bundle patches inside node_modules, which walkFiles skips on purpose.
+    const nm = join(root, 'node_modules')
+    if (await stat(nm).catch(() => null)) {
+      const scopes = await readdir(nm, { withFileTypes: true }).catch(() => [])
+      for (const sc of scopes) {
+        if (!sc.isDirectory()) continue
+        const scopeDir = join(nm, sc.name)
+        const pkgs = sc.name.startsWith('@')
+          ? (await readdir(scopeDir, { withFileTypes: true }).catch(() => [])).filter((e) => e.isDirectory()).map((e) => join(scopeDir, e.name))
+          : [scopeDir]
+        for (const pkgDir of pkgs) {
+          for (const cand of ['cordis.patch.yml', 'cordis.yml']) {
+            const p = join(pkgDir, cand)
+            if (await stat(p).catch(() => null) && !files.includes(p)) files.push(p)
+          }
+        }
+      }
+    }
+  }
+
+  /** Declarations carry a `name`; anything else only configures an entry that something declares. */
+  const declarations = new Map<string, { file: string; line: number; name: string }[]>()
+  const configRows: { id: string; file: string; line: number }[] = []
+  let rows = 0
+  for (const f of files) {
+    let text: string
+    try { text = await readFile(f, 'utf8') } catch { continue }
+    for (const row of parsePatchInserts(text)) {
+      rows++
+      if (row.name === null) { configRows.push({ id: row.id, file: f, line: row.line }); continue }
+      const list = declarations.get(row.id) ?? []
+      list.push({ file: f, line: row.line, name: row.name })
+      declarations.set(row.id, list)
+    }
+  }
+
+  const issues: PatchIssue[] = []
+  for (const [id, decls] of declarations) {
+    const byFile = new Map<string, typeof decls>()
+    for (const d of decls) { const l = byFile.get(d.file) ?? []; l.push(d); byFile.set(d.file, l) }
+    for (const [file, group] of byFile) {
+      if (group.length < 2) continue
+      issues.push({
+        kind: 'duplicate-declaration-same-file', severity: 3, id,
+        detail: `"${id}" is DECLARED ${group.length}x in one patch file. The loader builds its row map with Object.fromEntries, which keeps the LAST value for a duplicate key, so the earlier declaration is dropped and nothing is logged (cordis-plugin-loader/lib/index.js:82)`,
+        where: group.map((g) => `${g.file}:${g.line} (${g.name})`),
+      })
+    }
+    if (byFile.size > 1) {
+      issues.push({
+        kind: 'duplicate-declaration-cross-file', severity: 2, id,
+        detail: `"${id}" is declared by ${byFile.size} different patch files. The loader reuses ONE entry for the id (…:60) and the later declaration overwrites its options, so whichever composes last wins — a carefully configured row here can be replaced by a bundle's minimal one`,
+        where: decls.map((g) => `${g.file}:${g.line} (${g.name})`),
+      })
+    }
+  }
+  // A config row (`- id: x` + `disabled: true`) may legitimately target an entry declared by a bundle
+  // OUTSIDE this scan — dsh-base declares `tool-subagent*`, and it is not in a profile's node_modules.
+  // So an unresolved id is only reported when it is a near-miss of something that IS declared, which
+  // is the one case that means a typo rather than a scope limit. The rest are listed as informational.
+  const unresolvedConfigIds: { id: string; where: string }[] = []
+  const declaredIds = [...declarations.keys()]
+  const editDistance = (a: string, b: string): number => {
+    const prev = Array.from({ length: b.length + 1 }, (_, j) => j)
+    for (let i = 1; i <= a.length; i++) {
+      let diag = prev[0]
+      prev[0] = i
+      for (let j = 1; j <= b.length; j++) {
+        const tmp = prev[j]
+        prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1))
+        diag = tmp
+      }
+    }
+    return prev[b.length]
+  }
+  for (const c of configRows) {
+    if (declarations.has(c.id)) continue
+    // Short ids are within two edits of far too many things: `web` (the profile's own root row)
+    // matched a pile of `web-ui-*` declarations. Only ids long enough for a typo to be the likely
+    // explanation take part in the near-miss test.
+    const near = c.id.length < 8 ? [] : declaredIds.filter((d) => d.length >= 8 && d !== c.id && editDistance(c.id, d) <= 2)
+    if (near.length > 0) {
+      issues.push({
+        kind: 'dangling-config-row', severity: 2, id: c.id,
+        detail: `"${c.id}" is configured here but nothing in this scan declares it — it is ${near.length === 1 ? 'one edit away from' : 'close to'} the declared id(s) ${near.map((n) => `"${n}"`).join(', ')}, which usually means a typo rather than a bundle outside the scan`,
+        where: [`${c.file}:${c.line}`],
+      })
+    } else {
+      unresolvedConfigIds.push({ id: c.id, where: `${c.file}:${c.line}` })
+    }
+  }
+
+  issues.sort((a, b) => b.severity - a.severity || a.id.localeCompare(b.id))
+  const worst = issues.reduce((m, i) => Math.max(m, i.severity), 0)
+  return {
+    root,
+    patchFiles: files.length,
+    patchFileList: files,
+    rowCount: rows,
+    declarationCount: [...declarations.values()].reduce((n, l) => n + l.length, 0),
+    uniqueIds: declarations.size,
+    configRowCount: configRows.length,
+    /** Config rows whose id no scanned patch declares — informational: a bundle outside the scan may own it. */
+    unresolvedConfigIds,
+    issues,
+    verdict: worst >= 3 ? 'HIGH' : worst === 2 ? 'MEDIUM' : worst === 1 ? 'LOW' : 'SAFE',
+  }
+}
+
 export function apply(ctx: Ctx): void {
   const scanTool = (toolName: string): Tool => ({
     name: toolName,
@@ -201,6 +422,43 @@ export function apply(ctx: Ctx): void {
   for (const name of ['doctor_scan', 'doctor_scan_path']) {
     try { ctx.tools.register(scanTool(name)) } catch (err) { console.error(`[plugin-doctor] ${name} skipped: ${err}`) }
   }
+
+  const patchTool: Tool = {
+    name: 'doctor_patch',
+    description:
+      'Check cordis patch files for loader-row collisions. A patch file is one list of rows, given ' +
+      'either directly (`- id: … / name: …`) or inside an `- insert:` wrapper; a row WITH `name` ' +
+      'declares an entry, a row without one only configures or toggles it. Two declarations of the ' +
+      'same id in one file are DROPPED SILENTLY by the loader (its row map is built with ' +
+      'Object.fromEntries, which keeps the last value), so the plugin never mounts and no error is ' +
+      'logged; two declarations across files reuse one loader entry and the later one overwrites the ' +
+      'options. Also reports config rows whose id nothing declares. Read-only: parses YAML-shaped ' +
+      'text, never executes anything. Path must be an absolute path on this machine.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to a plugin directory, a profile directory, or a single patch file (default: current profile)' },
+      },
+    },
+    output: textOutput(),
+    timeoutMs: 60000,
+    isConcurrencySafe: () => true,
+    presentCall: (a) => ({ card: 'generic', title: 'doctor patch', kind: 'read', rawInput: a }),
+    async execute(args) {
+      const a = args as Record<string, Json>
+      let root: string
+      if (typeof a.path === 'string' && a.path) root = a.path
+      else root = join(homedir(), '.dsh', 'profiles', process.env.DSH_PROFILE ?? 'web')
+      if (!/^[A-Za-z]:[\\/]|^\//.test(root)) throw new Error('path must be an absolute path')
+      const res = await analyzePatches(root)
+      const info = res.unresolvedConfigIds.length ? `, ${res.unresolvedConfigIds.length} config row(s) owned outside this scan` : ''
+      const summary = res.issues.length === 0
+        ? `clean (${res.uniqueIds} declared ids across ${res.patchFiles} patch files${info})`
+        : `${res.issues.length} issue(s) / ${res.verdict} (${res.uniqueIds} declared ids, ${res.declarationCount} declarations across ${res.patchFiles} patch files${info})`
+      return { ok: true, summary, ...(res as unknown as Record<string, Json>) }
+    },
+  }
+  try { ctx.tools.register(patchTool) } catch (err) { console.error(`[plugin-doctor] doctor_patch skipped: ${err}`) }
 
   // HTTP: 注册到官方 ctx.webServer。
   //
