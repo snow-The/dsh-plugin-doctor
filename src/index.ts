@@ -420,7 +420,7 @@ export function apply(ctx: Ctx): void {
   })
 
   for (const name of ['doctor_scan', 'doctor_scan_path']) {
-    try { ctx.tools.register(scanTool(name)) } catch (err) { console.error(`[plugin-doctor] ${name} skipped: ${err}`) }
+    try { ctx.tools.register(scanTool(name)) } catch (err) { console.error(`[dsh-plugin-doctor] ${name} skipped: ${err}`) }
   }
 
   const patchTool: Tool = {
@@ -458,7 +458,7 @@ export function apply(ctx: Ctx): void {
       return { ok: true, summary, ...(res as unknown as Record<string, Json>) }
     },
   }
-  try { ctx.tools.register(patchTool) } catch (err) { console.error(`[plugin-doctor] doctor_patch skipped: ${err}`) }
+  try { ctx.tools.register(patchTool) } catch (err) { console.error(`[dsh-plugin-doctor] doctor_patch skipped: ${err}`) }
 
   // HTTP: 注册到官方 ctx.webServer。
   //

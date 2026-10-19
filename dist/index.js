@@ -324,7 +324,7 @@ function apply(ctx) {
     try {
       ctx.tools.register(scanTool(name2));
     } catch (err) {
-      console.error(`[plugin-doctor] ${name2} skipped: ${err}`);
+      console.error(`[dsh-plugin-doctor] ${name2} skipped: ${err}`);
     }
   }
   const patchTool = {
@@ -355,7 +355,7 @@ function apply(ctx) {
   try {
     ctx.tools.register(patchTool);
   } catch (err) {
-    console.error(`[plugin-doctor] doctor_patch skipped: ${err}`);
+    console.error(`[dsh-plugin-doctor] doctor_patch skipped: ${err}`);
   }
   ctx.inject?.(["webServer"], (webCtx) => {
     const register = (kind, path, handler) => {
