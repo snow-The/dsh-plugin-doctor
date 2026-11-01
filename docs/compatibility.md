@@ -11,10 +11,10 @@
 
 | 项 | 值 |
 |---|---|
-| `dsh.compatibility.dshReleases` | ["0.2.0-rc.1","0.2.0-rc.2"] |
-| `dsh.compatibility.verifiedAgainst` | `0.2.0-rc.2` |
-| 官方 peer 声明 | `dsh` >=0.2.0-rc.1 |
-| 本次宿主判定（`0.2.0-rc.2`） | **PASS** |
+| `dsh.compatibility.dshReleases` | ["0.2.1-rc.5"] |
+| `dsh.compatibility.verifiedAgainst` | `0.2.1-rc.5` |
+| 官方 peer 声明 | `dsh` >=0.2.1-rc.5 |
+| 本次宿主判定（`0.2.0-rc.2`） | **FAIL** |
 
 ## 门禁到底是什么（宿主实际执行的判定）
 
@@ -43,7 +43,7 @@
 ```
 插件        @snow-the/dsh-plugin-doctor@0.2.0
 宿主        0.2.0-rc.2
-判定        PASS（peerDependencies 无冲突，不会被禁用）
+判定        FAIL  {"@deepseek-ai/dsh":">=0.2.1-rc.5"}
 ```
 
 **这个判定的含义要说清楚：它只证明「宿主不会在预检阶段禁用本插件」。它不证明插件能正常工作。**
