@@ -75,6 +75,37 @@ interface PatchInsert {
  *      of the 59 rows in the real profile patch and hiding a genuine cross-file duplicate.
  */
 export declare function parsePatchInserts(text: string): PatchInsert[];
+/**
+ * A `file:` dependency is a COPY, not a link. Editing the source package does not
+ * change the installed copy, and `pnpm install` will NOT refresh it (the lockfile
+ * still says the dependency is satisfied). MEASURED 2026-11-06 on this machine:
+ * after editing `@snow-the/dsh-w8-sandbox` and bumping its version, the profile
+ * still had the 2026-10-19 copy — `client.js` 6798 bytes vs the source's 7285 —
+ * and 2 of 24 `file:` dependencies were stale. The fix that works is deleting
+ * `node_modules/<pkg>` for that dependency and running `dsh plugin --profile …
+ * install`; `install` alone does nothing.
+ *
+ * That is why this check exists: "I changed it and pushed it" and "the host runs
+ * it" are two different claims, and only the second one is worth reporting.
+ */
+export interface DriftDep {
+    name: string;
+    spec: string;
+    kind: 'file' | 'link';
+    state: 'ok' | 'stale' | 'docs-only' | 'missing' | 'wrong-link' | 'unreadable';
+    /** Relative paths whose content differs, capped — the evidence, not just a count. */
+    differs: string[];
+    detail: string;
+}
+export interface DriftReport {
+    profile: string;
+    checked: number;
+    deps: DriftDep[];
+    issues: DriftDep[];
+    verdict: 'SAFE' | 'LOW' | 'MEDIUM' | 'HIGH';
+}
+/** Compare every `file:` / `link:` dependency against the copy in the profile. */
+export declare function analyzeDrift(profileDir: string): Promise<DriftReport>;
 export declare function apply(ctx: Ctx): void;
 export declare function registerHttpRoutes(ctx: unknown, register: (kind: 'exact' | 'prefix', path: string, handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>) => void): void;
 export {};

@@ -1,5 +1,6 @@
 // src/index.ts
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join, extname } from "node:path";
 import { homedir } from "node:os";
 var name = "plugin-doctor";
@@ -292,6 +293,120 @@ async function analyzePatches(root) {
     verdict: worst >= 3 ? "HIGH" : worst === 2 ? "MEDIUM" : worst === 1 ? "LOW" : "SAFE"
   };
 }
+var DRIFT_SKIP = /* @__PURE__ */ new Set(["node_modules", ".git", ".cache"]);
+var DRIFT_MAX_FILES = 4e3;
+async function driftTree(dir, allow) {
+  const out = /* @__PURE__ */ new Map();
+  for (const root of allow?.length ? allow : ["."]) {
+    await driftWalk(dir, root.replace(/^\.\/?/, "").replace(/\/$/, ""), out);
+  }
+  return out;
+}
+async function driftWalk(dir, rel, out) {
+  if (out.size >= DRIFT_MAX_FILES) return;
+  const abs = rel === "" ? dir : join(dir, rel);
+  let st;
+  try {
+    st = await stat(abs);
+  } catch {
+    return;
+  }
+  if (st.isFile()) {
+    try {
+      out.set(rel, createHash("sha256").update(await readFile(abs)).digest("hex"));
+    } catch {
+    }
+    return;
+  }
+  let entries;
+  try {
+    entries = await readdir(abs, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (DRIFT_SKIP.has(e.name)) continue;
+    await driftWalk(dir, rel === "" ? e.name : `${rel}/${e.name}`, out);
+  }
+}
+var DRIFT_CODE_EXT = /* @__PURE__ */ new Set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".json", ".yml", ".yaml", ".node", ".wasm", ".css", ".html"]);
+function isCodeSurface(rel) {
+  if (/(^|\/)(LICENSE|COPYING|NOTICE)(\.|$)/i.test(rel)) return false;
+  const dot = rel.lastIndexOf(".");
+  const ext = dot < 0 ? "" : rel.slice(dot).toLowerCase();
+  if (ext === "" || ext === ".md" || ext === ".txt") return false;
+  return DRIFT_CODE_EXT.has(ext);
+}
+async function analyzeDrift(profileDir) {
+  const pkg = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  const deps = [];
+  for (const [name2, spec] of Object.entries(pkg.dependencies ?? {})) {
+    if (!/^(file|link):/.test(spec)) continue;
+    const kind = spec.startsWith("link:") ? "link" : "file";
+    const srcDir = spec.slice(5);
+    const dstDir = join(profileDir, "node_modules", name2);
+    const missing = await stat(dstDir).then(
+      () => false,
+      () => true
+    );
+    if (missing) {
+      deps.push({ name: name2, spec, kind, state: "missing", differs: [], detail: "declared in package.json but absent from node_modules" });
+      continue;
+    }
+    if (kind === "link") {
+      const [a, b] = await Promise.all([
+        realpath(srcDir).catch(() => null),
+        realpath(dstDir).catch(() => null)
+      ]);
+      deps.push(
+        a !== null && b !== null && a === b ? { name: name2, spec, kind, state: "ok", differs: [], detail: "linked to the source directory" } : { name: name2, spec, kind, state: "wrong-link", differs: [], detail: `link points at ${b ?? "(unresolvable)"} instead of ${a ?? srcDir}` }
+      );
+      continue;
+    }
+    let allow;
+    try {
+      const sp = JSON.parse(await readFile(join(srcDir, "package.json"), "utf8"));
+      allow = Array.isArray(sp.files) ? sp.files : void 0;
+    } catch {
+      allow = void 0;
+    }
+    const [src, dst] = await Promise.all([driftTree(srcDir, allow), driftTree(dstDir, allow)]);
+    if (src.size === 0) {
+      deps.push({ name: name2, spec, kind, state: "unreadable", differs: [], detail: "the source directory has no readable files (or the spec path is wrong)" });
+      continue;
+    }
+    const differs = [...src.keys()].filter((rel) => dst.get(rel) !== src.get(rel));
+    const code = differs.filter(isCodeSurface);
+    deps.push(
+      differs.length === 0 ? { name: name2, spec, kind, state: "ok", differs: [], detail: `${src.size} published file(s) identical` } : code.length === 0 ? {
+        name: name2,
+        spec,
+        kind,
+        state: "docs-only",
+        differs: differs.slice(0, 6),
+        detail: `only non-code files differ (${differs.slice(0, 3).join(", ")}) \u2014 the running code is the same copy`
+      } : {
+        name: name2,
+        spec,
+        kind,
+        state: "stale",
+        differs: code.slice(0, 6),
+        detail: `${code.length} of ${src.size} published CODE file(s) differ \u2014 the host loads the OLD copy; delete node_modules/${name2} and run dsh plugin --profile \u2026 install`
+      }
+    );
+  }
+  const issues = deps.filter((d) => d.state !== "ok");
+  const codeDrift = deps.filter((d) => d.state !== "ok" && d.state !== "docs-only");
+  return {
+    profile: profileDir,
+    checked: deps.length,
+    deps,
+    issues,
+    // Only CODE drift is a failure. Docs-only drift is still reported (it is a real difference,
+    // and a stale README ships wrong instructions), but it must not read like "your fix is missing".
+    verdict: codeDrift.length > 0 ? "HIGH" : issues.length > 0 ? "LOW" : "SAFE"
+  };
+}
 function apply(ctx) {
   const scanTool = (toolName) => ({
     name: toolName,
@@ -360,6 +475,37 @@ function apply(ctx) {
   } catch (err) {
     console.error(`[dsh-plugin-doctor] doctor_patch skipped: ${err}`);
   }
+  const driftTool = {
+    name: "doctor_drift",
+    description: "Compare every `file:` / `link:` dependency of a profile with the copy the host actually loads. A `file:` dependency is a COPY: editing the source package (and pushing it) does NOT change the installed copy, and `pnpm install` will not refresh it because the lockfile still says the dependency is satisfied \u2014 measured 2026-11-06, 2 of 24 file: dependencies were stale on this machine while their sources had newer code. Reports which published files differ, by content hash, with the fix. Read-only. Path must be an absolute path to a PROFILE directory (default: the current profile).",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path to a profile directory containing package.json (default: current profile)" }
+      }
+    },
+    output: textOutput(),
+    timeoutMs: 12e4,
+    isConcurrencySafe: () => true,
+    presentCall: (a) => ({ card: "generic", title: "doctor drift", kind: "read", rawInput: a }),
+    async execute(args) {
+      const a = args;
+      let root;
+      if (typeof a.path === "string" && a.path) root = a.path;
+      else root = join(homedir(), ".dsh", "profiles", process.env.DSH_PROFILE ?? "web");
+      if (!/^[A-Za-z]:[\\/]|^\//.test(root)) throw new Error("path must be an absolute path");
+      const res = await analyzeDrift(root);
+      const docsOnly = res.issues.filter((d) => d.state === "docs-only").length;
+      const codeDrift = res.issues.length - docsOnly;
+      const summary = res.issues.length === 0 ? `clean (${res.checked} file:/link: dependenc${res.checked === 1 ? "y" : "ies"} match their sources)` : codeDrift > 0 ? `${codeDrift} of ${res.checked} dependenc${res.checked === 1 ? "y" : "ies"} with CODE drift (${res.verdict}) \u2014 the host loads an older copy than the one you edited${docsOnly ? `; +${docsOnly} docs-only` : ""}` : `${docsOnly} of ${res.checked} differ in docs/licence only (LOW) \u2014 the running code is the same copy`;
+      return { ok: true, summary, ...res };
+    }
+  };
+  try {
+    ctx.tools.register(driftTool);
+  } catch (err) {
+    console.error(`[dsh-plugin-doctor] doctor_drift skipped: ${err}`);
+  }
   ctx.inject?.(["webServer"], (webCtx) => {
     const register = (kind, path, handler) => {
       webCtx.webServer.register({ kind, path, handler });
@@ -411,6 +557,7 @@ function registerHttpRoutes(ctx, register) {
   });
 }
 export {
+  analyzeDrift,
   apply,
   inject,
   name,

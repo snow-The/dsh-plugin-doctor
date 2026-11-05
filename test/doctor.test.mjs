@@ -27,10 +27,10 @@ function makeFixture() {
   return dir
 }
 
-test('registers three tools', () => {
+test('registers the doctor tools', () => {
   const ctx = makeCtx()
   apply(ctx)
-  assert.deepEqual(ctx.tools.map((t) => t.name).sort(), ['doctor_patch', 'doctor_scan', 'doctor_scan_path'])
+  assert.deepEqual(ctx.tools.map((t) => t.name).sort(), ['doctor_drift', 'doctor_patch', 'doctor_scan', 'doctor_scan_path'])
 })
 
 test('flags exfil, credentials, and lifecycle in fixture', async () => {

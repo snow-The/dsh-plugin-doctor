@@ -6,7 +6,8 @@
  * score. Heuristics are conservative — a hit means "read the evidence", not
  * "this is malware".
  */
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { readdir, readFile, realpath, stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { join, extname } from 'node:path'
 import { homedir } from 'node:os'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -403,6 +404,167 @@ async function analyzePatches(root: string) {
   }
 }
 
+// --- profile drift: the source you edited vs the copy the host actually loads ---
+
+/**
+ * A `file:` dependency is a COPY, not a link. Editing the source package does not
+ * change the installed copy, and `pnpm install` will NOT refresh it (the lockfile
+ * still says the dependency is satisfied). MEASURED 2026-11-06 on this machine:
+ * after editing `@snow-the/dsh-w8-sandbox` and bumping its version, the profile
+ * still had the 2026-10-19 copy — `client.js` 6798 bytes vs the source's 7285 —
+ * and 2 of 24 `file:` dependencies were stale. The fix that works is deleting
+ * `node_modules/<pkg>` for that dependency and running `dsh plugin --profile …
+ * install`; `install` alone does nothing.
+ *
+ * That is why this check exists: "I changed it and pushed it" and "the host runs
+ * it" are two different claims, and only the second one is worth reporting.
+ */
+export interface DriftDep {
+  name: string
+  spec: string
+  kind: 'file' | 'link'
+  state: 'ok' | 'stale' | 'docs-only' | 'missing' | 'wrong-link' | 'unreadable'
+  /** Relative paths whose content differs, capped — the evidence, not just a count. */
+  differs: string[]
+  detail: string
+}
+
+export interface DriftReport {
+  profile: string
+  checked: number
+  deps: DriftDep[]
+  issues: DriftDep[]
+  verdict: 'SAFE' | 'LOW' | 'MEDIUM' | 'HIGH'
+}
+
+const DRIFT_SKIP = new Set(['node_modules', '.git', '.cache'])
+const DRIFT_MAX_FILES = 4000
+
+/** 相对路径 -> 内容 sha256，按 `files[]` 白名单（与 npm 发布面一致）走。 */
+async function driftTree(dir: string, allow?: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  for (const root of allow?.length ? allow : ['.']) {
+    await driftWalk(dir, root.replace(/^\.\/?/, '').replace(/\/$/, ''), out)
+  }
+  return out
+}
+
+async function driftWalk(dir: string, rel: string, out: Map<string, string>): Promise<void> {
+  if (out.size >= DRIFT_MAX_FILES) return
+  const abs = rel === '' ? dir : join(dir, rel)
+  let st
+  try {
+    st = await stat(abs)
+  } catch {
+    return
+  }
+  if (st.isFile()) {
+    try {
+      out.set(rel, createHash('sha256').update(await readFile(abs)).digest('hex'))
+    } catch {
+      /* unreadable file is not a drift finding */
+    }
+    return
+  }
+  let entries
+  try {
+    entries = await readdir(abs, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    if (DRIFT_SKIP.has(e.name)) continue
+    await driftWalk(dir, rel === '' ? e.name : `${rel}/${e.name}`, out)
+  }
+}
+
+/** Which differing files mean "the running code is old" vs "the shipped docs are old". */
+const DRIFT_CODE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.json', '.yml', '.yaml', '.node', '.wasm', '.css', '.html'])
+
+function isCodeSurface(rel: string): boolean {
+  if (/(^|\/)(LICENSE|COPYING|NOTICE)(\.|$)/i.test(rel)) return false
+  const dot = rel.lastIndexOf('.')
+  const ext = dot < 0 ? '' : rel.slice(dot).toLowerCase()
+  if (ext === '' || ext === '.md' || ext === '.txt') return false
+  return DRIFT_CODE_EXT.has(ext)
+}
+
+/** Compare every `file:` / `link:` dependency against the copy in the profile. */
+export async function analyzeDrift(profileDir: string): Promise<DriftReport> {
+  const pkg = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8')) as {
+    dependencies?: Record<string, string>
+  }
+  const deps: DriftDep[] = []
+  for (const [name, spec] of Object.entries(pkg.dependencies ?? {})) {
+    if (!/^(file|link):/.test(spec)) continue
+    const kind: 'file' | 'link' = spec.startsWith('link:') ? 'link' : 'file'
+    const srcDir = spec.slice(5)
+    const dstDir = join(profileDir, 'node_modules', name)
+    const missing = await stat(dstDir).then(
+      () => false,
+      () => true,
+    )
+    if (missing) {
+      deps.push({ name, spec, kind, state: 'missing', differs: [], detail: 'declared in package.json but absent from node_modules' })
+      continue
+    }
+    if (kind === 'link') {
+      const [a, b] = await Promise.all([
+        realpath(srcDir).catch(() => null),
+        realpath(dstDir).catch(() => null),
+      ])
+      deps.push(
+        a !== null && b !== null && a === b
+          ? { name, spec, kind, state: 'ok', differs: [], detail: 'linked to the source directory' }
+          : { name, spec, kind, state: 'wrong-link', differs: [], detail: `link points at ${b ?? '(unresolvable)'} instead of ${a ?? srcDir}` },
+      )
+      continue
+    }
+    let allow: string[] | undefined
+    try {
+      const sp = JSON.parse(await readFile(join(srcDir, 'package.json'), 'utf8')) as { files?: string[] }
+      allow = Array.isArray(sp.files) ? sp.files : undefined
+    } catch {
+      allow = undefined
+    }
+    const [src, dst] = await Promise.all([driftTree(srcDir, allow), driftTree(dstDir, allow)])
+    if (src.size === 0) {
+      deps.push({ name, spec, kind, state: 'unreadable', differs: [], detail: 'the source directory has no readable files (or the spec path is wrong)' })
+      continue
+    }
+    const differs = [...src.keys()].filter((rel) => dst.get(rel) !== src.get(rel))
+    // LICENSE / README drift is real drift, but it is NOT the question this check exists to answer
+    // ("is the host running my code?"). Reporting it as a failure trains the reader to ignore the
+    // check — the same 常驻假红 trap this plugin was built to avoid. MEASURED 2026-11-06: the first
+    // real run found 2 "stale" packages, and both were LICENSE/README only.
+    const code = differs.filter(isCodeSurface)
+    deps.push(
+      differs.length === 0
+        ? { name, spec, kind, state: 'ok', differs: [], detail: `${src.size} published file(s) identical` }
+        : code.length === 0
+          ? {
+              name, spec, kind, state: 'docs-only', differs: differs.slice(0, 6),
+              detail: `only non-code files differ (${differs.slice(0, 3).join(', ')}) — the running code is the same copy`,
+            }
+          : {
+              name, spec, kind, state: 'stale', differs: code.slice(0, 6),
+              detail: `${code.length} of ${src.size} published CODE file(s) differ — the host loads the OLD copy; delete node_modules/${name} and run dsh plugin --profile … install`,
+            },
+    )
+  }
+  const issues = deps.filter((d) => d.state !== 'ok')
+  const codeDrift = deps.filter((d) => d.state !== 'ok' && d.state !== 'docs-only')
+  return {
+    profile: profileDir,
+    checked: deps.length,
+    deps,
+    issues,
+    // Only CODE drift is a failure. Docs-only drift is still reported (it is a real difference,
+    // and a stale README ships wrong instructions), but it must not read like "your fix is missing".
+    verdict: codeDrift.length > 0 ? 'HIGH' : issues.length > 0 ? 'LOW' : 'SAFE',
+  }
+}
+
 export function apply(ctx: Ctx): void {
   const scanTool = (toolName: string): Tool => ({
     name: toolName,
@@ -476,6 +638,45 @@ export function apply(ctx: Ctx): void {
     },
   }
   try { ctx.tools.register(patchTool) } catch (err) { console.error(`[dsh-plugin-doctor] doctor_patch skipped: ${err}`) }
+
+  const driftTool: Tool = {
+    name: 'doctor_drift',
+    description:
+      'Compare every `file:` / `link:` dependency of a profile with the copy the host actually loads. ' +
+      'A `file:` dependency is a COPY: editing the source package (and pushing it) does NOT change the ' +
+      'installed copy, and `pnpm install` will not refresh it because the lockfile still says the ' +
+      'dependency is satisfied — measured 2026-11-06, 2 of 24 file: dependencies were stale on this ' +
+      'machine while their sources had newer code. Reports which published files differ, by content ' +
+      'hash, with the fix. Read-only. Path must be an absolute path to a PROFILE directory (default: ' +
+      'the current profile).',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to a profile directory containing package.json (default: current profile)' },
+      },
+    },
+    output: textOutput(),
+    timeoutMs: 120000,
+    isConcurrencySafe: () => true,
+    presentCall: (a) => ({ card: 'generic', title: 'doctor drift', kind: 'read', rawInput: a }),
+    async execute(args) {
+      const a = args as Record<string, Json>
+      let root: string
+      if (typeof a.path === 'string' && a.path) root = a.path
+      else root = join(homedir(), '.dsh', 'profiles', process.env.DSH_PROFILE ?? 'web')
+      if (!/^[A-Za-z]:[\\/]|^\//.test(root)) throw new Error('path must be an absolute path')
+      const res = await analyzeDrift(root)
+      const docsOnly = res.issues.filter((d) => d.state === 'docs-only').length
+      const codeDrift = res.issues.length - docsOnly
+      const summary = res.issues.length === 0
+        ? `clean (${res.checked} file:/link: dependenc${res.checked === 1 ? 'y' : 'ies'} match their sources)`
+        : codeDrift > 0
+          ? `${codeDrift} of ${res.checked} dependenc${res.checked === 1 ? 'y' : 'ies'} with CODE drift (${res.verdict}) — the host loads an older copy than the one you edited${docsOnly ? `; +${docsOnly} docs-only` : ''}`
+          : `${docsOnly} of ${res.checked} differ in docs/licence only (LOW) — the running code is the same copy`
+      return { ok: true, summary, ...(res as unknown as Record<string, Json>) }
+    },
+  }
+  try { ctx.tools.register(driftTool) } catch (err) { console.error(`[dsh-plugin-doctor] doctor_drift skipped: ${err}`) }
 
   // HTTP: 注册到官方 ctx.webServer。
   //
