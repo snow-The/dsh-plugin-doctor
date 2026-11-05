@@ -584,7 +584,7 @@ export function driftWarning(report: DriftReport): string | undefined {
   const code = report.deps.filter((d) => d.state !== 'ok' && d.state !== 'docs-only')
   if (code.length === 0) return undefined
   const names = code.slice(0, 5).map((d) => `${d.name}${d.differs.length ? `(${d.differs.length} file${d.differs.length === 1 ? '' : 's'})` : ''}`).join(', ')
-  return `[dsh-plugin-doctor] ${code.length} plugin cop${code.length === 1 ? 'y' : 'ies'} differ from source in ${report.profile}: ${names}. The host is running OLDER code than the one you edited — delete node_modules/<pkg> and run dsh plugin --profile <name> install (pnpm install alone does not refresh file: deps).`
+  return `[dsh-plugin-doctor] ${code.length} plugin cop${code.length === 1 ? 'y differs' : 'ies differ'} from source in ${report.profile}: ${names}. The host is running OLDER code than the one you edited — delete node_modules/<pkg> and run dsh plugin --profile <name> install (pnpm install alone does not refresh file: deps).`
 }
 
 export function apply(ctx: Ctx): void {
