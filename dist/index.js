@@ -412,6 +412,12 @@ async function analyzeDrift(profileDir) {
     verdict: codeDrift.length > 0 ? "HIGH" : issues.length > 0 ? "LOW" : "SAFE"
   };
 }
+function driftWarning(report) {
+  const code = report.deps.filter((d) => d.state !== "ok" && d.state !== "docs-only");
+  if (code.length === 0) return void 0;
+  const names = code.slice(0, 5).map((d) => `${d.name}${d.differs.length ? `(${d.differs.length} file${d.differs.length === 1 ? "" : "s"})` : ""}`).join(", ");
+  return `[dsh-plugin-doctor] ${code.length} plugin cop${code.length === 1 ? "y" : "ies"} differ from source in ${report.profile}: ${names}. The host is running OLDER code than the one you edited \u2014 delete node_modules/<pkg> and run dsh plugin --profile <name> install (pnpm install alone does not refresh file: deps).`;
+}
 function apply(ctx) {
   const scanTool = (toolName) => ({
     name: toolName,
@@ -511,6 +517,14 @@ function apply(ctx) {
   } catch (err) {
     console.error(`[dsh-plugin-doctor] doctor_drift skipped: ${err}`);
   }
+  void (async () => {
+    try {
+      const dir = join(homedir(), ".dsh", "profiles", process.env.DSH_PROFILE ?? "web");
+      const line = driftWarning(await analyzeDrift(dir));
+      if (line !== void 0) console.warn(line);
+    } catch {
+    }
+  })();
   ctx.inject?.(["webServer"], (webCtx) => {
     const register = (kind, path, handler) => {
       webCtx.webServer.register({ kind, path, handler });
@@ -564,6 +578,7 @@ function registerHttpRoutes(ctx, register) {
 export {
   analyzeDrift,
   apply,
+  driftWarning,
   inject,
   name,
   parsePatchInserts,

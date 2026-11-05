@@ -128,6 +128,24 @@ test('docs-only drift is reported but not as a failure (calibration)', async () 
   assert.equal(r2.verdict, 'HIGH')
 })
 
+test('the startup warning fires for CODE drift and stays silent otherwise', async () => {
+  // 这条检查被做成「启动时自己跑」而不是「文档里写着」：文档 09-27 就写了同一件事，
+  // 2026-11-06 我仍然差点宣称「已生效」。机制要在那一秒响，而那一秒永远是启动。
+  const { driftWarning } = await import('../dist/index.js')
+
+  const stale = fixture({ spec: 'file', source: { 'index.js': 'v2\n' }, installed: { 'index.js': 'v1\n' } })
+  const w = driftWarning(await analyzeDrift(stale.profile))
+  assert.ok(w, 'stale code must produce a warning')
+  assert.match(w, /@x\/y/, 'the warning names the package')
+  assert.match(w, /delete node_modules/, 'and the fix that works')
+
+  const docs = fixture({ spec: 'file', files: ['index.js', 'LICENSE'], source: { 'index.js': 'x\n', LICENSE: 'new\n' }, installed: { 'index.js': 'x\n' } })
+  assert.equal(driftWarning(await analyzeDrift(docs.profile)), undefined, 'docs-only drift must not warn at startup')
+
+  const clean = fixture({ spec: 'file', source: { 'index.js': 'same\n' }, installed: { 'index.js': 'same\n' } })
+  assert.equal(driftWarning(await analyzeDrift(clean.profile)), undefined, 'a clean profile must not warn')
+})
+
 test('non file:/link: dependencies are ignored', async () => {
   const root = mkdtempSync(join(tmpdir(), 'drift-plain-'))
   roots.push(root)

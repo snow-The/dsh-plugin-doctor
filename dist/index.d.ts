@@ -106,6 +106,17 @@ export interface DriftReport {
 }
 /** Compare every `file:` / `link:` dependency against the copy in the profile. */
 export declare function analyzeDrift(profileDir: string): Promise<DriftReport>;
+/**
+ * 这次漂移要不要在**启动时**报出来：只有代码漂移才报，且只报一次。
+ *
+ * 为什么要在启动时查：这条纪律写在 `dsh-own` 技能里已经两个月（2026-09-27：
+ * 「判定改动是否上线，要看 profile 里的活副本」），而 2026-11-06 我仍然先改了源码、
+ * 跑完测试、推了 GitHub，然后差点宣称「已生效」—— 文档没有被读到的时刻，它就等于不存在。
+ * 「重启后以为已经生效」正是最该响的那一秒，而它每次都发生在启动。
+ *
+ * @returns 一行要打到 stderr 的警告；没有代码漂移时返回 undefined（文档漂移静默）。
+ */
+export declare function driftWarning(report: DriftReport): string | undefined;
 export declare function apply(ctx: Ctx): void;
 export declare function registerHttpRoutes(ctx: unknown, register: (kind: 'exact' | 'prefix', path: string, handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>) => void): void;
 export {};
