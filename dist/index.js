@@ -234,11 +234,14 @@ async function analyzePatches(root) {
       });
     }
     if (byFile.size > 1) {
+      const parentOf = (f) => f.replace(/[\\/][^\\/]+$/, "");
+      const isUserLayer = (f) => parentOf(f) === root.replace(/[\\/]+$/, "");
+      const userFiles = [...byFile.keys()].filter(isUserLayer);
       issues.push({
         kind: "duplicate-declaration-cross-file",
-        severity: 2,
+        severity: userFiles.length > 0 ? 3 : 1,
         id,
-        detail: `"${id}" is declared by ${byFile.size} different patch files. The loader reuses ONE entry for the id (\u2026:60) and the later declaration overwrites its options, so whichever composes last wins \u2014 a carefully configured row here can be replaced by a bundle's minimal one`,
+        detail: userFiles.length > 0 ? `"${id}" is declared by ${byFile.size} patch files, and ${userFiles.length} of them is YOUR layer (${userFiles.map((f) => f.replace(root, ".").replace(/^[\\/]/, "")).join(", ")}). The loader keeps ONE entry per id and the later declaration overwrites its options, so your carefully configured row CAN be replaced. Compare with \`dsh --dump-config\` before trusting either layer.` : `"${id}" is declared by ${byFile.size} patch files, all of them under node_modules (a bundle and the plugin's own patch). Your layer does not declare it, so no configuration of yours is at stake here \u2014 what decides the options is the layer composition order. Reported as info so this is not mistaken for "my settings were eaten".`,
         where: decls.map((g) => `${g.file}:${g.line} (${g.name})`)
       });
     }

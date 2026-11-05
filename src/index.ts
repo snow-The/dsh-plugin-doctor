@@ -326,9 +326,26 @@ async function analyzePatches(root: string) {
       })
     }
     if (byFile.size > 1) {
+      // 关键区分（2026-11-05 实测）：跨文件重复有两种，后果完全不同。
+      //   (a) 你的层（profile 根下的 cordis.patch.yml / cordis.yml，不在 node_modules 里）
+      //       与别的层各声明一次 → loader 只留一个 entry、后声明覆盖选项，**你的配置可能被盖掉**。
+      //   (b) 全都在 node_modules 里（bundle 与插件自带的 patch 各声明一次）→ 你的配置不在其中，
+      //       这里没有「我的设置被吃了」这回事，只有层的组合顺序问题。
+      // 混为一谈的代价实测过：16 条跨文件重复里只有 2 条涉及用户层，14 条属于 (b)，
+      // 而它们被一律报成 severity 2，等于训练人忽略这条告警。
+      const parentOf = (f: string): string => f.replace(/[\\/][^\\/]+$/, '')
+      // 「你的层」= **直接坐落在被扫描目录根上**的 patch（profile 自己的 cordis.patch.yml / cordis.yml）。
+      // 不能用「不在 node_modules 里」当判据：子目录里的 patch 同样是别人给的层
+      // （插件自带的测试夹具就是 a/ 与 b/ 两个子目录，那样会把它误判成用户层）。
+      const isUserLayer = (f: string): boolean => parentOf(f) === root.replace(/[\\/]+$/, '')
+      const userFiles = [...byFile.keys()].filter(isUserLayer)
       issues.push({
-        kind: 'duplicate-declaration-cross-file', severity: 2, id,
-        detail: `"${id}" is declared by ${byFile.size} different patch files. The loader reuses ONE entry for the id (…:60) and the later declaration overwrites its options, so whichever composes last wins — a carefully configured row here can be replaced by a bundle's minimal one`,
+        kind: 'duplicate-declaration-cross-file',
+        severity: userFiles.length > 0 ? 3 : 1,
+        id,
+        detail: userFiles.length > 0
+          ? `"${id}" is declared by ${byFile.size} patch files, and ${userFiles.length} of them is YOUR layer (${userFiles.map((f) => f.replace(root, '.').replace(/^[\\/]/, '')).join(', ')}). The loader keeps ONE entry per id and the later declaration overwrites its options, so your carefully configured row CAN be replaced. Compare with \`dsh --dump-config\` before trusting either layer.`
+          : `"${id}" is declared by ${byFile.size} patch files, all of them under node_modules (a bundle and the plugin's own patch). Your layer does not declare it, so no configuration of yours is at stake here — what decides the options is the layer composition order. Reported as info so this is not mistaken for "my settings were eaten".`,
         where: decls.map((g) => `${g.file}:${g.line} (${g.name})`),
       })
     }

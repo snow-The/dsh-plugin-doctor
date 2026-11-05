@@ -275,10 +275,34 @@ test('the same id across TWO patch files is reported as MEDIUM, not HIGH', async
     'b/cordis.patch.yml': ['- insert:', '    - id: shared', "      name: '@x/two'"].join('\n'),
   })
   const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
-  assert.equal(r.verdict, 'MEDIUM')
+  // 2026-11-05 起：跨文件重复分两种。两个都在子目录里 = 都是别人给的层（bundle / 插件自带 patch），
+  // 你的配置不在其中 → 只报 info，免得「我的设置被吃了」变成常驻噪音。
+  assert.equal(r.verdict, 'LOW')
   assert.equal(r.issues.length, 1)
   assert.equal(r.issues[0].kind, 'duplicate-declaration-cross-file')
+  assert.equal(r.issues[0].severity, 1)
   assert.equal(r.patchFiles, 2)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('the same id where one declaration IS the profile root layer is HIGH (your config can be replaced)', async () => {
+  const ctx = makeCtx(); apply(ctx)
+  const dir = patchFixture({
+    'cordis.patch.yml': [
+      '- insert:',
+      '    - id: shared',
+      "      name: '@x/mine'",
+      '      config:',
+      '        keep: me',
+    ].join('\n'),
+    'node_modules/@x/bundle/cordis.patch.yml': ['- insert:', '    - id: shared', "      name: '@x/mine'"].join('\n'),
+  })
+  const r = await ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: dir })
+  const dup = r.issues.find((i) => i.kind === 'duplicate-declaration-cross-file')
+  assert.ok(dup, 'expected a cross-file duplicate issue')
+  assert.equal(dup.severity, 3, 'your layer is at stake → HIGH, not MEDIUM')
+  assert.match(dup.detail, /YOUR layer/)
+  assert.equal(r.verdict, 'HIGH')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -343,4 +367,75 @@ test('a config row beside its own declaration is NOT dangling', async () => {
 test('doctor_patch rejects relative paths', async () => {
   const ctx = makeCtx(); apply(ctx)
   await assert.rejects(() => ctx.tools.find((t) => t.name === 'doctor_patch').execute({ path: 'x' }), /absolute/)
+})
+
+
+// ---------------------------------------------------------------------------------------------
+// Official Host/Origin + browser-auth fence (copied from @deepseek-ai/dsh-host-open-in-app; the
+// provenance block in src/index.ts names the exact official lines).
+//
+// DISCRIMINATING, by construction: every case asserts BOTH the status AND that the handler's own
+// payload was never produced (`res.body === undefined` and no content-type). Status alone cannot
+// prove our fence ran -- the platform also rejects /api requests by itself (see
+// _recover/verify-webServer-routes.mjs, CTRL-B), and that control is deliberately kept red.
+// Remove the guard from the handler and every case below goes red; that is verified by
+// _recover/reverse-verify-fence.mjs, which disarms the built artifact and requires the suite to fail.
+// ---------------------------------------------------------------------------------------------
+
+/** Mount the routes with a fence whose verdict the test controls. */
+function mountWithFence(rejection) {
+  const routes = new Map()
+  // 'unavailable' models a composition that never registered the `connection` service at all.
+  const ctx = rejection === 'unavailable'
+    ? {}
+    : { get: (name) => (name === 'connection' ? { requestRejection: () => rejection } : undefined) }
+  registerHttpRoutes(ctx, (kind, path, handler) => routes.set(path, { kind, handler }))
+  return routes
+}
+
+const FENCE_ROUTES = ['/api/doctor/health']
+
+/** Drive one registered handler with a fake native req/res. */
+async function driveFence(routes, path, method = 'GET') {
+  const route = routes.get(path)
+  assert.ok(route, 'route not registered: ' + path)
+  const res = { statusCode: 0, headers: {}, body: undefined, setHeader(k, v) { this.headers[k] = v }, end(b) { this.body = b } }
+  await route.handler({ method, url: path }, res)
+  return res
+}
+
+test('fence: a 401 from the connection service is answered 401 and the handler never runs', async () => {
+  const routes = mountWithFence(401)
+  for (const path of FENCE_ROUTES) {
+    const res = await driveFence(routes, path)
+    assert.equal(res.statusCode, 401)
+    assert.equal(res.body, undefined, 'the handler payload must not be produced')
+    assert.equal(res.headers['content-type'], undefined, 'the JSON responder must not run')
+  }
+})
+
+test('fence: a 403 from the connection service is answered 403 and the handler never runs', async () => {
+  const routes = mountWithFence(403)
+  for (const path of FENCE_ROUTES) {
+    const res = await driveFence(routes, path)
+    assert.equal(res.statusCode, 403)
+    assert.equal(res.body, undefined, 'the handler payload must not be produced')
+    assert.equal(res.headers['content-type'], undefined, 'the JSON responder must not run')
+  }
+})
+
+test('fence: an unreachable connection service fails CLOSED with 503, never forwarding', async () => {
+  const routes = mountWithFence('unavailable')
+  for (const path of FENCE_ROUTES) {
+    const res = await driveFence(routes, path)
+    assert.equal(res.statusCode, 503, 'a missing fence must NOT fall through to the handler')
+    assert.match(String(res.body), /unavailable/)
+    assert.equal(res.headers['content-type'], 'application/json; charset=utf-8')
+  }
+})
+
+test('fence: the fence runs BEFORE the method check', async () => {
+  const routes = mountWithFence(403)
+  const res = await driveFence(routes, FENCE_ROUTES[0], 'POST')
+  assert.equal(res.statusCode, 403, 'a rejected request must not be downgraded to 405')
 })
