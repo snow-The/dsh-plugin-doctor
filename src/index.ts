@@ -71,7 +71,12 @@ const RULES: Rule[] = [
   ['obf-hidden-unicode', 'hidden Unicode (checked per-char, see scan)', /[\u200B-\u200D\u202A-\u202E\u2060\uFEFF\u00AD]/g, 2],
   ['persist-registry', 'registry autostart', /HKCU\s*\\\s*Software\s*\\\s*Microsoft\s*\\\s*Windows\s*\\\s*CurrentVersion\s*\\\s*Run|reg\s+add/g, 3],
   ['persist-startup', 'startup folder / scheduled task', /Startup\s*\\|schtasks|Start-Process.*-WindowStyle.*Hidden/g, 2],
-  ['persist-shellrc', 'shell rc append', /(?:bashrc|zshrc|profile)\s*>>|Add-Content.*(?:bashrc|zshrc|profile)/g, 2],
+  // 原正则只认 `bashrc >>`（名字在前），但真实的追加写法是 `echo x >> ~/.bashrc`（重定向在前），
+  // 于是它对最常见的持久化写法**永远不报**。反向量测（test/rules-fire.test.mjs）第一条就抓到它：
+  // 13 条规则里只有这一条对「必然该命中」的样本毫无反应。
+  // 三个方向都认，并且大小写都认（`(?i:…)` 修饰组，Node 22+ 已支持）——
+  // PowerShell 写的是 `$PROFILE`，全小写/只有首字母大写的正则会漏掉它（实测漏了）。
+  ['persist-shellrc', 'shell rc append', /(?:^|[^A-Za-z])>>\s*[^\n]{0,90}?(?i:bashrc|zshrc|profile)\b|(?i:bashrc|zshrc|profile)\s*>>|(?i:add-content)[^\n]{0,80}(?i:bashrc|zshrc|profile)/g, 2],
   ['destructive-rm', 'recursive force delete of root', /rm\s+-rf\s+(?:\/|\$HOME\s*\/\s*\*|~\s*\/\s*\*)|Remove-Item.*-Recurse.*(?:\\|C:)/g, 3],
   ['destructive-git', 'force push', /git\s+push.*--force|git\s+push.*-f\b/g, 1],
 ]
